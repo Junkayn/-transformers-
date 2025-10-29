@@ -6,119 +6,129 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
-from transformers import pipeline
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.edge.service import Service
-from selenium.webdriver.edge.options import Options
-from selenium.common.exceptions import NoSuchElementException
+import threading
+import logging
+import asyncio
+
+from playwright.async_api import async_playwright
 
 # ------------------------------- 中文显示设置 -------------------------------
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 中文字体
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-# ------------------------------- 初始化情绪分析模型 -------------------------------
-sentiment_pipeline = pipeline(
-    "sentiment-analysis",
-    model="IDEA-CCNL/Erlangshen-Roberta-110M-Sentiment"
-)
+# ------------------------------- 禁用 transformers 日志 -------------------------------
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"  # 🔒 强制离线模式
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# ------------------------------- 浏览器初始化 -------------------------------
-def init_browser():
-    edge_driver_path = os.path.expanduser(r"D:\ljz-privated\python\analyze\msedgedriver.exe")  # 改成你的路径
-    service = Service(edge_driver_path)
-    options = Options()
-    options.add_argument("--start-maximized")
-    driver = webdriver.Edge(service=service, options=options)
-    return driver
+# ------------------------------- 模型路径与缓存设置 -------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "models", "Sentiment", "snapshots",
+                          "7c257c5cde3225d0789acfa8d67eb043289b0295")
+MODEL_CACHE = os.path.join(BASE_DIR, "model_cache.pkl")
+COOKIES_PATH = os.path.join(BASE_DIR, "cookies.json")
 
-# ------------------------------- Cookies -------------------------------
-def save_cookies(driver, cookies_file="cookies.pkl"):
-    cookies = driver.get_cookies()
-    with open(cookies_file, "wb") as f:
-        pickle.dump(cookies, f)
 
-def load_cookies(driver, cookies_file="cookies.pkl"):
-    if os.path.exists(cookies_file):
-        driver.get("https://weibo.com/")
-        time.sleep(2)
-        with open(cookies_file, "rb") as f:
-            cookies = pickle.load(f)
-            for cookie in cookies:
-                driver.add_cookie(cookie)
-        driver.get("https://weibo.com/")
-        time.sleep(2)
-        return True
-    return False
+# ------------------------------- 异步浏览器逻辑 -------------------------------
+async def async_browser_workflow(weibo_url, progress_callback):
+    """异步执行微博登录、评论抓取"""
+    async with async_playwright() as p:
+        # 尝试加载 cookies
+        if os.path.exists(COOKIES_PATH):
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=os.path.join(BASE_DIR, "user_data"),
+                channel="msedge",
+                headless=False,
+                storage_state=COOKIES_PATH
+            )
+            page = await context.new_page()
+            await page.goto("https://weibo.com/")
+            progress_callback("✅ 已加载登录状态")
+        else:
+            browser = await p.chromium.launch(channel="msedge", headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto("https://weibo.com/login.php")
+            progress_callback("请在浏览器中登录微博…")
 
-# ------------------------------- 等待登录 -------------------------------
-def wait_for_login(driver, progress_callback=None):
-    driver.get("https://weibo.com/login.php")
-    if progress_callback:
-        progress_callback("请在浏览器中手动登录微博…")
-    time.sleep(5)
-    last_url = ""
-    while True:
-        time.sleep(3)
-        current_url = driver.current_url
-        if "login" not in current_url and "passport" not in current_url:
-            try:
-                driver.find_element(By.CSS_SELECTOR, "input[placeholder='搜索微博']")
-                save_cookies(driver)
-                if progress_callback:
+            # 等待登录成功
+            while True:
+                await asyncio.sleep(3)
+                url = page.url
+                if "login" not in url and "passport" not in url:
                     progress_callback("✅ 登录成功")
-                break
-            except NoSuchElementException:
-                pass
-        if current_url != last_url:
-            last_url = current_url
-    # 如果长时间没登录，也可以在这里设置超时提示登录失败（可选）
+                    await context.storage_state(path=COOKIES_PATH)
+                    break
 
-# ------------------------------- 抓取评论 -------------------------------
-def get_comments(driver, url, max_comments=200, progress_callback=None):
-    driver.get(url)
-    time.sleep(5)
-    users, comments = [], []
+        # 抓取评论
+        progress_callback("开始抓取评论…")
+        await page.goto(weibo_url)
+        await asyncio.sleep(5)
 
-    while len(comments) < max_comments:
-        user_elems = driver.find_elements(By.CSS_SELECTOR, "div.con1.woo-box-item-flex a")
-        comment_elems = driver.find_elements(By.CSS_SELECTOR, "div.text > span")
+        users, comments = [], []
+        while len(comments) < 200:
+            user_elems = await page.locator("div.con1.woo-box-item-flex a").all_text_contents()
+            comment_elems = await page.locator("div.text > span").all_text_contents()
 
-        for i in range(min(len(user_elems), len(comment_elems))):
-            if len(comments) >= max_comments:
-                break
-            user = user_elems[i].text.strip()
-            comment = comment_elems[i].text.strip()
-            
-            # --------- 过滤折叠回复 ---------
-            if not comment or comment.startswith("共") and "条回复" in comment:
-                continue
+            for u, c in zip(user_elems, comment_elems):
+                c = c.strip()
+                if not c or (c.startswith("共") and "条回复" in c):
+                    continue
+                users.append(u.strip())
+                comments.append(c)
+                if len(comments) >= 200:
+                    break
 
-            users.append(user)
-            comments.append(comment)
-
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-
-        if progress_callback:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
             progress_callback(f"已抓取 {len(comments)} 条评论…")
 
-        # 当已经没有新评论加载时，退出循环
-        if len(user_elems) == 0 or len(comment_elems) == 0:
-            break
+            if len(user_elems) == 0 or len(comment_elems) == 0:
+                break
 
-    return users, comments
+        await context.close()
+        return users, comments
+
+
+# ------------------------------- 加载或缓存模型 -------------------------------
+def load_model(progress_callback=None):
+    if progress_callback:
+        progress_callback("正在加载情绪分析模型…")
+
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline, logging
+    logging.set_verbosity_error()
+
+    if os.path.exists(MODEL_CACHE):
+        try:
+            if progress_callback:
+                progress_callback("加载本地模型缓存中…")
+            with open(MODEL_CACHE, "rb") as f:
+                tokenizer, model = pickle.load(f)
+            model.eval()
+            return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
+        except Exception:
+            os.remove(MODEL_CACHE)
+
+    if progress_callback:
+        progress_callback("首次加载模型（仅需一次）…")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH, local_files_only=True)
+    model.eval()
+
+    with open(MODEL_CACHE, "wb") as f:
+        pickle.dump((tokenizer, model), f)
+
+    return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
 
 
 # ------------------------------- 情绪分析 -------------------------------
-def analyze_sentiment(users, comments, progress_callback=None):
+def analyze_sentiment(users, comments, sentiment_pipeline, progress_callback=None):
     data = []
     for idx, (user, c) in enumerate(zip(users, comments), start=1):
         try:
             result = sentiment_pipeline(c[:512])[0]
-            label = result['label']
-            score = result['score']
-
+            label, score = result['label'], result['score']
             threshold = 0.6
             if score < threshold:
                 sentiment = "中性"
@@ -128,23 +138,22 @@ def analyze_sentiment(users, comments, progress_callback=None):
                 sentiment = "消极"
             else:
                 sentiment = "中性"
-        except:
-            sentiment = "中性"
-            score = 0
+        except Exception:
+            sentiment, score = "中性", 0
         data.append({"用户": user, "评论": c, "情绪": sentiment, "置信度": score})
-
         if progress_callback:
             progress_callback(f"分析评论 {idx}/{len(comments)}")
 
     return pd.DataFrame(data)
 
+
 # ------------------------------- 可视化 -------------------------------
 def visualize_sentiment(df, canvas_frame):
     summary = df["情绪"].value_counts(normalize=True) * 100
-    fig, ax = plt.subplots(figsize=(5,3))
-    summary.plot(kind="bar", ax=ax, color=["green","red","gray"])
-    ax.set_title("情绪分布")
-    ax.set_ylabel("百分比")
+    fig, ax = plt.subplots(figsize=(5, 3))
+    summary.plot(kind="bar", ax=ax, color=["green", "red", "gray"])
+    ax.set_title("情绪分布", fontproperties="Microsoft YaHei")
+    ax.set_ylabel("百分比", fontproperties="Microsoft YaHei")
 
     for i, v in enumerate(summary):
         ax.text(i, v + 0.5, f"{v:.1f}%", ha='center', fontname='Microsoft YaHei')
@@ -154,11 +163,12 @@ def visualize_sentiment(df, canvas_frame):
     canvas.draw()
     canvas.get_tk_widget().pack(fill='both', expand=True)
 
+
 # ------------------------------- Tkinter UI -------------------------------
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("微博评论情绪分析")
+        root.title("微博评论情绪分析（Playwright异步版）")
         root.geometry("600x500")
 
         self.label = tk.Label(root, text="请输入要分析的微博帖子链接：")
@@ -176,43 +186,45 @@ class App:
         self.canvas_frame = tk.Frame(root)
         self.canvas_frame.pack(fill='both', expand=True)
 
+        self.sentiment_pipeline = None
+        threading.Thread(target=self.preload_model, daemon=True).start()
+
     def update_progress(self, msg):
         self.progress_label.config(text=msg)
         self.root.update()
+
+    def preload_model(self):
+        self.sentiment_pipeline = load_model(progress_callback=self.update_progress)
+        self.update_progress("✅ 模型加载完成")
 
     def start_analysis(self):
         weibo_url = self.entry.get().strip()
         if not weibo_url:
             messagebox.showwarning("提示", "请输入微博帖子链接")
             return
+        if self.sentiment_pipeline is None:
+            messagebox.showinfo("提示", "模型正在加载，请稍后再试…")
+            return
 
-        self.update_progress("初始化浏览器…")
-        driver = init_browser()
+        def run_async():
+            asyncio.run(self._async_main(weibo_url))
+        threading.Thread(target=run_async, daemon=True).start()
 
-        # 登录处理
-        if not load_cookies(driver):
-            wait_for_login(driver, progress_callback=self.update_progress)
-        else:
-            self.update_progress("✅ 已加载登录状态")
-
-        # 抓取评论
-        self.update_progress("开始抓取评论…")
-        users, comments = get_comments(driver, weibo_url, max_comments=200, progress_callback=self.update_progress)
-
-        driver.quit()
-
+    async def _async_main(self, weibo_url):
+        users, comments = await async_browser_workflow(weibo_url, self.update_progress)
         if len(comments) == 0:
             messagebox.showerror("错误", "未抓取到评论，请检查微博是否公开或评论区是否加载。")
             return
 
-        # 情绪分析
         self.update_progress("开始情绪分析…")
-        df = analyze_sentiment(users, comments, progress_callback=self.update_progress)
+        df = analyze_sentiment(users, comments, self.sentiment_pipeline, progress_callback=self.update_progress)
         df.to_csv("weibo_comments_sentiment.csv", index=False, encoding="utf-8-sig")
 
         self.update_progress("分析完成，已生成 CSV 文件")
         visualize_sentiment(df, self.canvas_frame)
 
+
+# ------------------------------- 程序入口 -------------------------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
