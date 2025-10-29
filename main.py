@@ -9,19 +9,17 @@ import matplotlib.pyplot as plt
 import threading
 import logging
 import asyncio
-
 from playwright.async_api import async_playwright
 
-# ------------------------------- 中文显示设置 -------------------------------
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-# ------------------------------- 禁用 transformers 日志 -------------------------------
+
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"  # 🔒 强制离线模式
+os.environ["TRANSFORMERS_OFFLINE"] = "1"  
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# ------------------------------- 模型路径与缓存设置 -------------------------------
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "Sentiment", "snapshots",
                           "7c257c5cde3225d0789acfa8d67eb043289b0295")
@@ -29,11 +27,11 @@ MODEL_CACHE = os.path.join(BASE_DIR, "model_cache.pkl")
 COOKIES_PATH = os.path.join(BASE_DIR, "cookies.json")
 
 
-# ------------------------------- 异步浏览器逻辑 -------------------------------
+
 async def async_browser_workflow(weibo_url, progress_callback):
     """异步执行微博登录、评论抓取"""
     async with async_playwright() as p:
-        # 尝试加载 cookies
+        # 加载 cookies
         if os.path.exists(COOKIES_PATH):
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=os.path.join(BASE_DIR, "user_data"),
@@ -43,7 +41,7 @@ async def async_browser_workflow(weibo_url, progress_callback):
             )
             page = await context.new_page()
             await page.goto("https://weibo.com/")
-            progress_callback("✅ 已加载登录状态")
+            progress_callback("已加载登录状态✅️")
         else:
             browser = await p.chromium.launch(channel="msedge", headless=False)
             context = await browser.new_context()
@@ -56,7 +54,7 @@ async def async_browser_workflow(weibo_url, progress_callback):
                 await asyncio.sleep(3)
                 url = page.url
                 if "login" not in url and "passport" not in url:
-                    progress_callback("✅ 登录成功")
+                    progress_callback("登录成功✅️")
                     await context.storage_state(path=COOKIES_PATH)
                     break
 
@@ -90,7 +88,6 @@ async def async_browser_workflow(weibo_url, progress_callback):
         return users, comments
 
 
-# ------------------------------- 加载或缓存模型 -------------------------------
 def load_model(progress_callback=None):
     if progress_callback:
         progress_callback("正在加载情绪分析模型…")
@@ -122,7 +119,6 @@ def load_model(progress_callback=None):
     return pipeline("sentiment-analysis", model=model, tokenizer=tokenizer, device=-1)
 
 
-# ------------------------------- 情绪分析 -------------------------------
 def analyze_sentiment(users, comments, sentiment_pipeline, progress_callback=None):
     data = []
     for idx, (user, c) in enumerate(zip(users, comments), start=1):
@@ -147,7 +143,6 @@ def analyze_sentiment(users, comments, sentiment_pipeline, progress_callback=Non
     return pd.DataFrame(data)
 
 
-# ------------------------------- 可视化 -------------------------------
 def visualize_sentiment(df, canvas_frame):
     summary = df["情绪"].value_counts(normalize=True) * 100
     fig, ax = plt.subplots(figsize=(5, 3))
@@ -164,7 +159,6 @@ def visualize_sentiment(df, canvas_frame):
     canvas.get_tk_widget().pack(fill='both', expand=True)
 
 
-# ------------------------------- Tkinter UI -------------------------------
 class App:
     def __init__(self, root):
         self.root = root
@@ -195,7 +189,7 @@ class App:
 
     def preload_model(self):
         self.sentiment_pipeline = load_model(progress_callback=self.update_progress)
-        self.update_progress("✅ 模型加载完成")
+        self.update_progress("模型加载完成✅️")
 
     def start_analysis(self):
         weibo_url = self.entry.get().strip()
@@ -224,7 +218,6 @@ class App:
         visualize_sentiment(df, self.canvas_frame)
 
 
-# ------------------------------- 程序入口 -------------------------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = App(root)
